@@ -89,7 +89,11 @@ All **19 raw files** were compared with Step 1's retained inventory and matched.
 
 ## Commit / clean bundle procedure and remaining limits
 
-Inspect staged content before each genuine local commit. After committing these fixes, run the existing `analysis/validate_source_review.py` against the separate pack to verify the committed tracked-only copy again. Regenerate only the clean source bundle with:
+The six staged files (core/config/tests, README, design and this findings record) were inspected; no private input, PDF, environment, cache, render or secret was staged. Genuine local fix commit: `a919c95e8aab8c03ba6967d1d32f9d3e7fc2f73b`.
+
+After that commit, actually ran `python -E -S analysis/validate_source_review.py "C:\Users\dell\Desktop\bb bn\ridgeline_data_pack (2)"` with the same bundled interpreter. It archived **all 26 committed tracked files** into `tmp/source review n024zzx7/tracked copy`, with the private pack separate and no ignored helper copied. The clean-copy suite passed **26 tests in 9.833 s**, exit 0. The package import, both checker CWD cases and report regeneration all exited 0; CSV/report hashes matched those above, the input hash inventory was unchanged for all 19 files, and AST import checking found no third-party Python dependency. Full subprocess argv/results are retained locally in ignored `tmp/step4b-clean-copy.json`. This is distinct from the working-tree run above. The follow-up commit records only this observed validation; the delivered archive is regenerated from final HEAD.
+
+Regenerate only the clean source bundle with:
 
 ```text
 git archive --format=zip --output=tmp/review_bundle.zip HEAD
