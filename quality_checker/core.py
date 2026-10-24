@@ -59,8 +59,11 @@ class WeatherRecord:
     def value(self, channel: str) -> float | None:
         return dict(self.numeric_values).get(channel)
 
-    def signature(self) -> tuple[str, ...]:
-        return tuple(value for _, value in self.raw_fields)
+    def signature(self, *, include_timestamp: bool = True) -> tuple[tuple[str, str], ...]:
+        # Preserve exact raw text (including extra columns), but never attach
+        # meaning to header position. Only the named timestamp may be omitted.
+        return tuple(sorted((name, value) for name, value in self.raw_fields
+                            if include_timestamp or name != "timestamp_utc"))
 
 
 @dataclass(frozen=True)
@@ -78,6 +81,7 @@ class GPSObservation:
     latitude: float | None
     longitude: float | None
     altitude_m: float | None
+    gga_fix_minute: str | None = None
 
     @property
     def trustworthy_time(self) -> bool:
@@ -94,6 +98,15 @@ class GPSObservation:
         if self.sentence_type == "GGA":
             return self.gga_fix_quality is not None and self.gga_fix_quality > 0
         return False
+
+    @property
+    def trustworthy_altitude(self) -> bool:
+        # Altitude is parsed only for explicit metre units. Estimated/manual/
+        # simulated or unknown fixes cannot affirm an elevation-based keep.
+        return (self.sentence_type == "GGA" and self.trustworthy_position
+                and self.gga_fix_quality in {1, 2, 3, 4, 5}
+                and self.logger_time is not None and self.altitude_m is not None
+                and self.gga_fix_minute is not None and math.isfinite(self.altitude_m))
 
 
 @dataclass(frozen=True)
@@ -280,6 +293,7 @@ def _parse_gps_file(path: Path, station_id: str) -> list[GPSObservation]:
             gps_time = None
             status = None
             fix_quality = None
+            gga_fix_minute = None
             latitude = longitude = altitude = None
             try:
                 if kind == "RMC":
@@ -288,10 +302,14 @@ def _parse_gps_file(path: Path, station_id: str) -> list[GPSObservation]:
                     latitude = nmea_coordinate(fields[3], fields[4], True)
                     longitude = nmea_coordinate(fields[5], fields[6], False)
                 elif kind == "GGA":
+                    fix_time = _parse_datetime(fields[1].split(".", 1)[0], "%H%M%S")
+                    gga_fix_minute = fix_time.strftime("%H:%M") if fix_time is not None else None
                     fix_quality = int(fields[6]) if fields[6] else None
                     latitude = nmea_coordinate(fields[2], fields[3], True)
                     longitude = nmea_coordinate(fields[4], fields[5], False)
-                    altitude = float(fields[9]) if fields[9] else None
+                    if fields[9] and fields[10] == "M":
+                        candidate = float(fields[9])
+                        altitude = candidate if math.isfinite(candidate) else None
             except (IndexError, TypeError, ValueError):
                 pass
             observations.append(
@@ -309,6 +327,7 @@ def _parse_gps_file(path: Path, station_id: str) -> list[GPSObservation]:
                     latitude,
                     longitude,
                     altitude,
+                    gga_fix_minute,
                 )
             )
     return observations
@@ -547,11 +566,36 @@ def _group_consecutive(indices: Sequence[int], max_gap: int = 1) -> list[list[in
     return groups
 
 
+def _continuous_links(station: StationData, excluded: set[int]) -> set[int]:
+    """Indices connected to the preceding source row by one valid UTC interval."""
+    interval = timedelta(minutes=station.interval_minutes)
+    return {index for index in range(1, len(station.records))
+            if index not in excluded and index - 1 not in excluded
+            and station.records[index].interpreted_utc is not None
+            and station.records[index - 1].interpreted_utc is not None
+            and station.records[index].interpreted_utc - station.records[index - 1].interpreted_utc == interval}
+
+
+def _group_temporal(station: StationData, indices: Sequence[int], excluded: set[int], max_gap: int = 1) -> list[list[int]]:
+    """Group source indices only across uninterrupted, increasing nominal UTC."""
+    if not indices:
+        return []
+    links = _continuous_links(station, excluded)
+    groups = [[indices[0]]]
+    for index in indices[1:]:
+        previous = groups[-1][-1]
+        if index - previous <= max_gap and all(step in links for step in range(previous + 1, index + 1)):
+            groups[-1].append(index)
+        else:
+            groups.append([index])
+    return groups
+
+
 def _timeline_checks(station: StationData, config: Thresholds) -> tuple[list[Flag], list[Diagnostic], set[int]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
     duplicate_indices: set[int] = set()
-    first_signature: dict[tuple[str, ...], int] = {}
+    first_signature: dict[tuple[tuple[str, str], ...], int] = {}
     duplicate_to_original: dict[int, int] = {}
     for index, record in enumerate(station.records):
         signature = record.signature()
@@ -583,7 +627,7 @@ def _timeline_checks(station: StationData, config: Thresholds) -> tuple[list[Fla
             by_time[record.interpreted_utc].append(index)
     conflicted_indices: set[int] = set()
     for timestamp, indices in sorted(by_time.items()):
-        signatures = {station.records[index].signature()[1:] for index in indices}
+        signatures = {station.records[index].signature(include_timestamp=False) for index in indices}
         if len(signatures) > 1:
             conflicted_indices.update(indices)
             rows = [station.records[index].source_row for index in indices]
@@ -628,9 +672,25 @@ def _gps_checks(station: StationData, config: Thresholds) -> tuple[list[Flag], l
             Diagnostic(station.station_id, "metadata", None, None, "partial GPS evidence", f"{invalid_checksums} checksum-invalid sentences and {void_rmc} void RMC positions were ignored.", "This does not invalidate weather measurements; only valid messages may support timing/location conclusions.")
         )
     summary: dict[str, Any] = {"valid_positions": len(positions), "median_altitude_m": None, "median_distance_m": None}
-    altitudes = [observation.altitude_m for observation in positions if observation.altitude_m is not None]
+    altitude_epochs: dict[tuple[str, str], list[float]] = defaultdict(list)
+    altitude_logger_epochs = set()
+    for observation in station.gps:
+        if observation.trustworthy_altitude:
+            key = (observation.logger_time.date().isoformat(), observation.gga_fix_minute)
+            altitude_epochs[key].append(observation.altitude_m)
+            altitude_logger_epochs.add(observation.logger_time.replace(second=0, microsecond=0))
+    # Replayed GGA fixes cannot gain votes just because logger labels advance.
+    # GGA supplies no date: logger date is only a conservative deduplication
+    # bucket, never an invented absolute GPS/weather timestamp.
+    altitudes = [statistics.median(values) for values in altitude_epochs.values()]
+    summary["altitude_epochs"] = min(len(altitudes), len(altitude_logger_epochs))
+    summary["altitude_agreement_fraction"] = 0.0
     if altitudes:
         summary["median_altitude_m"] = statistics.median(altitudes)
+        elevation = _metadata_number(station, "elevation_m")
+        if elevation is not None and math.isfinite(elevation):
+            summary["altitude_agreement_fraction"] = sum(abs(value - elevation) <= config.gps_altitude_agreement_m
+                                                          for value in altitudes) / len(altitudes)
     try:
         metadata_lat = float(station.metadata["lat"])
         metadata_lon = float(station.metadata["lon"])
@@ -656,6 +716,8 @@ def _physical_violation(channel: str, value: float | None) -> bool:
         return False
     if channel == "rh_pct":
         return not 0 <= value <= 100
+    if channel == "pressure_hpa":
+        return value <= 0
     if channel == "wind_kmh":
         return value < 0
     if channel == "wind_dir_deg":
@@ -687,7 +749,7 @@ def _parse_and_missing_checks(station: StationData, excluded: set[int]) -> tuple
             for index, record in enumerate(station.records)
             if index not in excluded and record.interpreted_utc is not None and record.value(channel) is None
         ]
-        for group in _group_consecutive(missing):
+        for group in _group_temporal(station, missing, excluded):
             first, last = station.records[group[0]], station.records[group[-1]]
             assert first.interpreted_utc and last.interpreted_utc
             flags.append(
@@ -708,7 +770,7 @@ def _domain_checks(station: StationData, excluded: set[int], config: Thresholds)
     flags = []
     for channel in CHANNELS:
         violations = [index for index, record in enumerate(station.records) if index not in excluded and record.interpreted_utc and _physical_violation(channel, record.value(channel))]
-        for candidate in _group_consecutive(violations, config.domain_cluster_gap_intervals + 1):
+        for candidate in _group_temporal(station, violations, excluded, config.domain_cluster_gap_intervals + 1):
             span = candidate[-1] - candidate[0] + 1
             if len(candidate) / span < config.domain_cluster_min_fraction:
                 groups = _group_consecutive(candidate)
@@ -728,6 +790,7 @@ def _domain_checks(station: StationData, excluded: set[int], config: Thresholds)
 def _persistence_checks(station: StationData, excluded: set[int], config: Thresholds) -> list[Flag]:
     flags = []
     interval_hours = station.interval_minutes / 60.0
+    continuous = _continuous_links(station, excluded)
     rules = {
         "temp_c": config.temp_flatline_min_hours,
         "pressure_hpa": config.pressure_flatline_min_hours,
@@ -742,7 +805,7 @@ def _persistence_checks(station: StationData, excluded: set[int], config: Thresh
                 continue
             value = station.records[start].value(channel)
             end = start + 1
-            while end < len(station.records) and end not in excluded and station.records[end].value(channel) == value:
+            while end < len(station.records) and end in continuous and station.records[end].value(channel) == value:
                 end += 1
             length = end - start
             active_direction = True
@@ -800,7 +863,7 @@ def _unique_series(station: StationData, excluded_indices: set[int]) -> dict[dat
             groups[record.interpreted_utc].append(record)
     result = {}
     for timestamp, records in groups.items():
-        if len({record.signature()[1:] for record in records}) == 1:
+        if len({record.signature(include_timestamp=False) for record in records}) == 1:
             result[timestamp] = records[0]
     return result
 
@@ -1223,9 +1286,22 @@ def _high_elevation_keep(station: StationData, gps_summary: dict[str, Any], unre
     pressure_values = [record.value("pressure_hpa") for record in station.records if record.value("pressure_hpa") is not None and record.interpreted_utc]
     gps_altitude = gps_summary.get("median_altitude_m")
     coverage = _coverage(station)
-    if elevation is None or not pressure_values or gps_altitude is None or coverage is None:
+    if (elevation is None or not math.isfinite(elevation) or not pressure_values
+            or gps_altitude is None or not math.isfinite(gps_altitude) or coverage is None):
         return []
     if any(flag.station_id == station.station_id and flag.channel in {"all", "pressure_hpa", "metadata"} and flag.action == "exclude" for flag in unreliable_flags):
+        return []
+    if not config.high_elevation_min_m <= elevation <= config.high_elevation_keep_max_m:
+        return []
+    if (gps_summary.get("altitude_epochs", 0) < config.gps_min_altitude_observations
+            or gps_summary.get("altitude_agreement_fraction", 0.0) < config.gps_altitude_min_agreement_fraction):
+        return []
+    # NASA's approximate tropospheric model supplies only a broad plausibility
+    # screen, NOT an expected reading, calibration, or sea-level conversion.
+    # Every pressure must pass; a normal median cannot hide invalid/tiny values.
+    reference_hpa = 1012.9 * ((15.04 - 0.00649 * elevation + 273.1) / 288.08) ** 5.256
+    if not all(config.high_elevation_pressure_min_ratio * reference_hpa <= value
+               <= config.high_elevation_pressure_max_ratio * reference_hpa for value in pressure_values):
         return []
     median_pressure = statistics.median(pressure_values)
     if elevation >= config.high_elevation_min_m and median_pressure <= config.high_elevation_pressure_max_hpa and abs(gps_altitude - elevation) <= config.gps_altitude_agreement_m:

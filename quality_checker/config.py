@@ -16,6 +16,8 @@ class Thresholds:
     gps_offset_change_seconds: int = 5 * 60
     gps_boundary_tolerance_seconds: int = 2 * 60
     gps_min_position_observations: int = 20
+    gps_min_altitude_observations: int = 20
+    gps_altitude_min_agreement_fraction: float = 0.80
     gps_location_disagreement_m: float = 5_000.0
 
     # Replay and gap handling.
@@ -71,7 +73,12 @@ class Thresholds:
 
     # Explicit keep evidence for station pressure at high elevation.
     high_elevation_min_m: float = 2_000.0
+    high_elevation_keep_max_m: float = 11_000.0
     high_elevation_pressure_max_hpa: float = 800.0
+    # Broad screening band around an approximate standard atmosphere, not a
+    # physical exclusion threshold or a calibrated expected station pressure.
+    high_elevation_pressure_min_ratio: float = 0.70
+    high_elevation_pressure_max_ratio: float = 1.30
     gps_altitude_agreement_m: float = 150.0
 
 

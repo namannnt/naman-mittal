@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from quality_checker import run_checker
-from quality_checker.core import FLAG_COLUMNS, CHANNELS, input_hashes, nmea_coordinate
+from quality_checker.core import FLAG_COLUMNS, CHANNELS, input_hashes, nmea_coordinate, _unique_series
 from quality_checker.config import DEFAULT_THRESHOLDS
 
 
@@ -132,6 +132,240 @@ def write_pack(
 
 
 class CheckerTests(unittest.TestCase):
+    def test_invalid_timestamp_breaks_persistence_and_preserves_diagnostic(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2036, 1, 1, tzinfo=UTC)
+            rows = regular_rows(start, 40, lambda i, t, b: {"temp_c": 6.5})
+            rows[-1]["timestamp_utc"] = "not-a-time"
+            pack = write_pack(root, {"target": rows})
+            result = run_checker(pack, root / "out")
+            records = result.stations[0].records
+            self.assertEqual(len(records), 40)
+            self.assertEqual(records[-1].raw_timestamp, "not-a-time")
+            self.assertIsNone(records[-1].interpreted_utc)
+            self.assertEqual(records[-1].source_row, 41)
+            diagnostics = [d for d in result.diagnostics if d.candidate == "unparseable weather timestamp"]
+            self.assertEqual(len(diagnostics), 1)
+            self.assertIn("Source rows 41-41", diagnostics[0].evidence)
+            self.assertIsNone(diagnostics[0].start_utc)
+            self.assertIsNone(diagnostics[0].end_utc)
+            persistence = [f for f in result.flags if f.issue == "implausible persistence" and f.channel == "temp_c"]
+            self.assertEqual(len(persistence), 1)
+            self.assertEqual((persistence[0].start_utc, persistence[0].end_utc),
+                             (start, start + timedelta(minutes=380)))
+            self.assertIn("39 consecutive source rows 2-40", persistence[0].note)
+
+    def test_persistence_does_not_bridge_daily_outages(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2036, 2, 1, tzinfo=UTC)
+            rows = [row for day in range(4) for row in
+                    regular_rows(start + timedelta(days=day), 10, lambda i, t, b: {"temp_c": 6.5})]
+            pack = write_pack(root, {"target": rows})
+            result = run_checker(pack, root / "out")
+            self.assertFalse(any(f.issue == "implausible persistence" for f in result.flags))
+            gaps = [f for f in result.flags if f.issue == "coverage gap"]
+            self.assertEqual(len(gaps), 3)
+            for day, gap in enumerate(gaps):
+                self.assertEqual(gap.start_utc, start + timedelta(days=day, minutes=100))
+                self.assertEqual(gap.end_utc, start + timedelta(days=day + 1, minutes=-10))
+                self.assertIn("134 nominal", gap.note)
+
+    def test_high_elevation_pressure_requires_positive_plausible_values(self) -> None:
+        for label, pressures, invalid, keep in (
+            ("negative", (-5, -4), True, False),
+            ("zero", (0, 0), True, False),
+            ("tiny", (1, 2), False, False),
+            ("plausible", (709, 710), False, True),
+        ):
+            with self.subTest(case=label), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                start = datetime(2036, 3, 1, tzinfo=UTC)
+                rows = regular_rows(start, 24, lambda i, t, b: {"pressure_hpa": pressures[i % 2]})
+                gps = []
+                for i in range(24):
+                    timestamp = start + timedelta(minutes=10 * i)
+                    gps.extend([f"{timestamp:%Y-%m-%d %H:%M:%S},{rmc(timestamp)}",
+                                f"{timestamp:%Y-%m-%d %H:%M:%S},{gga(timestamp, altitude=2913)}"])
+                pack = write_pack(root, {"target": rows}, metadata={"target": {"elevation_m": "2913"}},
+                                  gps={"target": gps})
+                result = run_checker(pack, root / "out")
+                pressure_flags = [f for f in result.flags if f.channel == "pressure_hpa"]
+                self.assertEqual(any(f.action == "keep" for f in pressure_flags), keep)
+                domain = [f for f in pressure_flags if f.issue == "physical-domain violation"]
+                self.assertEqual(bool(domain), invalid)
+                if invalid:
+                    self.assertEqual((domain[0].start_utc, domain[0].end_utc),
+                                     (start, start + timedelta(minutes=230)))
+                if label == "tiny":
+                    self.assertFalse(pressure_flags, "Insufficient plausibility withholds keep, not a guessed exclusion")
+
+    def test_conflicts_and_replays_are_independent_of_column_order(self) -> None:
+        decisions = []
+        start = datetime(2036, 4, 1, tzinfo=UTC)
+        for first_column in ("timestamp_utc", "temp_c"):
+            with self.subTest(first_column=first_column), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                rows = regular_rows(start, 24)
+                conflict = dict(rows[10], temp_c="30")
+                rows.insert(11, conflict)
+                rows.append(dict(rows[4]))
+                pack = write_pack(root, {"target": rows})
+                fields = ["timestamp_utc", *CHANNELS]
+                fields.remove(first_column)
+                fields.insert(0, first_column)
+                with (pack / "data" / "target.csv").open("w", encoding="utf-8", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fields, lineterminator="\n")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                result = run_checker(pack, root / "out")
+                conflicts = [f for f in result.flags if f.issue == "conflicting observations"]
+                self.assertEqual(len(conflicts), 1)
+                self.assertEqual((conflicts[0].start_utc, conflicts[0].end_utc),
+                                 (start + timedelta(minutes=100), start + timedelta(minutes=100)))
+                self.assertIn("source rows 12-13", conflicts[0].note)
+                replay = [f for f in result.flags if f.issue == "exact replay copies"]
+                self.assertEqual(len(replay), 1)
+                self.assertIn("replay source rows 27-27; retain original rows 6-6", replay[0].note)
+                # Exercise the separate peer-series safeguard without relying on
+                # timeline exclusions to conceal an order-dependent comparison.
+                series = _unique_series(result.stations[0], set())
+                self.assertNotIn(start + timedelta(minutes=100), series)
+                self.assertEqual(series[start + timedelta(minutes=40)].source_row, 6)
+                self.assertEqual(len(series), 23)
+                decisions.append([f.as_row() for f in result.flags])
+        self.assertEqual(len(decisions), 2)
+        self.assertEqual(decisions[0], decisions[1])
+
+    def test_missing_and_domain_groups_require_continuous_utc(self) -> None:
+        for issue, channel, value in (("missing/non-numeric readings", "temp_c", ""),
+                                      ("physical-domain violation", "rh_pct", "103")):
+            for days in (range(4), range(3, -1, -1)):
+                with self.subTest(issue=issue, days=list(days)), workspace_tempdir() as temporary:
+                    root = Path(temporary)
+                    start = datetime(2036, 5, 1, tzinfo=UTC)
+                    rows = [row for day in days for row in regular_rows(start + timedelta(days=day), 10)]
+                    for row in rows:
+                        row[channel] = value
+                    pack = write_pack(root, {"target": rows})
+                    result = run_checker(pack, root / "out")
+                    flags = [f for f in result.flags if f.issue == issue and f.channel == channel]
+                    self.assertEqual(len(flags), 4)
+                    self.assertEqual({f.start_utc for f in flags}, {start + timedelta(days=i) for i in range(4)})
+                    self.assertTrue(all(f.end_utc - f.start_utc == timedelta(minutes=90) for f in flags))
+                    self.assertEqual(sum(f.issue == "coverage gap" for f in result.flags), 3)
+
+    def test_high_elevation_keep_requires_repeated_valid_altitude_epochs(self) -> None:
+        for case in ("valid", "single", "repeated_epoch", "nineteen", "wrong_units", "bad_checksum",
+                     "no_fix", "estimated_fix", "simulated_fix", "bad_logger", "bad_fix_time", "stale_fix_time",
+                     "nan", "inf", "inconsistent"):
+            with self.subTest(case=case), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                start = datetime(2036, 6, 1, tzinfo=UTC)
+                rows = regular_rows(start, 24, lambda i, t, b: {"pressure_hpa": 709 + i % 2})
+                gps = []
+                count = 1 if case == "single" else 19 if case == "nineteen" else 24
+                for i in range(count):
+                    timestamp = start + timedelta(minutes=10 * (0 if case == "repeated_epoch" else i))
+                    fix = {"no_fix": 0, "estimated_fix": 6, "simulated_fix": 8}.get(case, 1)
+                    altitude = float(case) if case in {"nan", "inf"} else 4000 if case == "inconsistent" and i >= 18 else 2913
+                    sentence = gga(start if case == "stale_fix_time" else timestamp, fix=fix, altitude=altitude)
+                    if case == "wrong_units":
+                        body = sentence[1:].split("*", 1)[0].split(",")
+                        body[10] = "F"
+                        sentence = checksum(",".join(body))
+                    if case == "bad_fix_time":
+                        body = sentence[1:].split("*", 1)[0].split(",")
+                        body[1] = "not-a-time"
+                        sentence = checksum(",".join(body))
+                    if case == "bad_checksum":
+                        sentence = sentence[:-2] + ("00" if sentence[-2:] != "00" else "FF")
+                    logger = "not-a-time" if case == "bad_logger" else f"{timestamp:%Y-%m-%d %H:%M:%S}"
+                    gps.extend([f"{timestamp:%Y-%m-%d %H:%M:%S},{rmc(timestamp)}", f"{logger},{sentence}"])
+                pack = write_pack(root, {"target": rows}, metadata={"target": {"elevation_m": "2913"}},
+                                  gps={"target": gps})
+                result = run_checker(pack, root / "out")
+                self.assertEqual(any(f.action == "keep" for f in result.flags), case == "valid")
+                self.assertFalse(any(f.action == "exclude" and f.channel == "pressure_hpa" for f in result.flags))
+
+    def test_pressure_keep_cannot_contradict_existing_exclusions(self) -> None:
+        for case in ("missing_pressure", "nonpositive_pressure", "pressure_flatline", "replay", "location"):
+            with self.subTest(case=case), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                start = datetime(2036, 7, 1, tzinfo=UTC)
+                rows = regular_rows(start, 40, lambda i, t, b: {"pressure_hpa": 709 + i % 2})
+                if case == "missing_pressure":
+                    rows[20]["pressure_hpa"] = ""
+                elif case == "nonpositive_pressure":
+                    rows[20]["pressure_hpa"] = "0"
+                elif case == "pressure_flatline":
+                    for row in rows:
+                        row["pressure_hpa"] = "709"
+                elif case == "replay":
+                    rows.append(dict(rows[10]))
+                gps = []
+                for i in range(24):
+                    timestamp = start + timedelta(minutes=10 * i)
+                    lat = 45 if case == "location" else 40
+                    gps.extend([f"{timestamp:%Y-%m-%d %H:%M:%S},{rmc(timestamp, lat=lat)}",
+                                f"{timestamp:%Y-%m-%d %H:%M:%S},{gga(timestamp, lat=lat, altitude=2913)}"])
+                pack = write_pack(root, {"target": rows}, metadata={"target": {"elevation_m": "2913"}},
+                                  gps={"target": gps})
+                result = run_checker(pack, root / "out")
+                self.assertTrue(any(f.action == "exclude" and f.channel in {"pressure_hpa", "all", "metadata"}
+                                    for f in result.flags))
+                self.assertFalse(any(f.action == "keep" for f in result.flags))
+
+    def test_persistence_breaks_at_invalid_backward_offgrid_and_conflicted_rows(self) -> None:
+        for case in ("invalid_middle", "backward", "offgrid", "conflict", "replay"):
+            with self.subTest(case=case), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                start = datetime(2036, 8, 1, tzinfo=UTC)
+                rows = regular_rows(start, 40, lambda i, t, b: {"temp_c": 6.5})
+                if case == "invalid_middle":
+                    rows[20]["timestamp_utc"] = "not-a-time"
+                elif case in {"backward", "offgrid"}:
+                    next_start = start - timedelta(days=1) if case == "backward" else start + timedelta(minutes=201)
+                    rows[20:] = regular_rows(next_start, 20, lambda i, t, b: {"temp_c": 6.5})
+                elif case == "conflict":
+                    rows.insert(20, dict(rows[19], rh_pct="70"))
+                else:
+                    rows.insert(20, dict(rows[19]))
+                pack = write_pack(root, {"target": rows})
+                result = run_checker(pack, root / "out")
+                self.assertFalse(any(f.issue == "implausible persistence" for f in result.flags))
+                if case == "conflict":
+                    self.assertTrue(any(f.issue == "conflicting observations" for f in result.flags))
+                elif case == "replay":
+                    self.assertTrue(any(f.issue == "exact replay copies" for f in result.flags))
+                elif case == "invalid_middle":
+                    self.assertTrue(any(d.candidate == "unparseable weather timestamp" for d in result.diagnostics))
+
+    def test_pressure_keep_checks_whole_series_and_elevation_plausibility(self) -> None:
+        for case, elevation, pressure, expected in (
+            ("one_tiny_value", 2913, 709, False),
+            ("wrong_for_elevation", 7000, 750, False),
+            ("plausible_at_higher_site", 7000, 410, True),
+            ("beyond_model", 12000, 200, False),
+        ):
+            with self.subTest(case=case), workspace_tempdir() as temporary:
+                root = Path(temporary)
+                start = datetime(2036, 9, 1, tzinfo=UTC)
+                rows = regular_rows(start, 24, lambda i, t, b: {"pressure_hpa": pressure + i % 2})
+                if case == "one_tiny_value":
+                    rows[12]["pressure_hpa"] = "1"
+                gps = []
+                for i in range(24):
+                    timestamp = start + timedelta(minutes=10 * i)
+                    gps.extend([f"{timestamp:%Y-%m-%d %H:%M:%S},{rmc(timestamp)}",
+                                f"{timestamp:%Y-%m-%d %H:%M:%S},{gga(timestamp, altitude=elevation)}"])
+                pack = write_pack(root, {"target": rows}, metadata={"target": {"elevation_m": str(elevation)}},
+                                  gps={"target": gps})
+                result = run_checker(pack, root / "out")
+                self.assertEqual(any(f.action == "keep" for f in result.flags), expected)
+                self.assertFalse(any(f.channel == "pressure_hpa" and f.action == "exclude" for f in result.flags))
+
     def test_replay_conflict_gap_and_required_schema(self) -> None:
         with workspace_tempdir() as temporary:
             root = Path(temporary)
