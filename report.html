@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Ridgeline network health — 1 Mar–11 Apr 2025</title>
+<style>
+@page { size: A4 portrait; margin: 11mm 12mm; }
+* { box-sizing: border-box; }
+html { background: #e9ebe9; color: #202524; }
+body { margin: 0; font: 10pt/1.32 Arial, Helvetica, sans-serif; }
+main { width: 186mm; margin: 20px auto; padding: 11mm 0; background: #fff; }
+header { border-top: 3px solid #234b47; padding-top: 9px; }
+.eyebrow { margin: 0 0 5px; font-size: 8.4pt; font-weight: 700; letter-spacing: 1.4px; text-transform: uppercase; }
+h1 { font-size: 25pt; line-height: 1.05; letter-spacing: -.6px; margin: 0 0 6px; font-weight: 700; }
+.meta { margin: 0; font-size: 9pt; color: #424b48; }
+.lead { margin: 10px 0 11px; padding: 9px 0 9px 12px; border-left: 3px solid #234b47; }
+.lead strong { display: block; font-size: 13pt; margin-bottom: 4px; }
+.lead p { margin: 0; }
+h2 { margin: 0 0 5px; font-size: 11pt; line-height: 1.2; }
+.legend { margin: 0 0 8px; font-size: 8.5pt; color: #343b38; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 9.3pt; line-height: 1.27; }
+col.station { width: 9%; } col.use { width: 33%; } col.exception { width: 58%; }
+thead { display: table-header-group; }
+thead th { padding: 6px 7px; text-align: left; background: #edf1ef; border-top: 1px solid #56605b; border-bottom: 1px solid #56605b; font-size: 8.5pt; }
+tbody th, tbody td { padding: 5px 7px; vertical-align: top; border-bottom: 1px solid #c5cbc7; overflow-wrap: break-word; }
+tbody th { text-align: left; font-weight: 700; }
+tr { break-inside: avoid; page-break-inside: avoid; }
+.table-note { font-size: 8.3pt; margin: 7px 0 9px; line-height: 1.3; }
+.visit { border: 1px solid #5b6560; border-left: 3px solid #234b47; padding: 10px 12px; break-inside: avoid; page-break-inside: avoid; }
+.visit h2 { font-size: 13pt; margin-bottom: 5px; }
+.visit .first { margin: 0 0 7px; }
+.visit-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 14px; }
+ol { list-style: none; padding: 0; margin: 0; }
+li { margin: 0 0 4px; padding-left: 48px; position: relative; }
+li time { position: absolute; left: 0; font-weight: 700; font-size: 8.5pt; padding-top: 1px; }
+.visit p { margin: 0 0 6px; font-size: 9pt; }
+.visit .runner { border-top: 1px solid #c5cbc7; margin: 6px 0 0; padding-top: 7px; }
+.limits { margin-top: 8px; font-size: 8.4pt; line-height: 1.32; }
+.limits p { margin: 0 0 5px; }
+footer { border-top: 1px solid #8d9791; margin-top: 8px; padding-top: 5px; font-size: 8pt; color: #424b48; }
+@media print {
+ html, body { background: #fff; }
+ main { width: auto; margin: 0; padding: 0; }
+ header, .visit, thead th { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+}
+@media screen and (max-width: 760px) {
+ main { width: auto; margin: 0; padding: 18px; }
+ h1 { font-size: 23pt; }
+ .visit-grid { grid-template-columns: 1fr; gap: 3px; }
+ table { font-size: 9pt; }
+}
+</style>
+</head>
+<body><main>
+<header>
+<p class="eyebrow">Ridgeline schools weather network · Decision note</p>
+<h1>Network health &amp; the next visit</h1>
+<p class="meta">Supplied record: <strong>1 Mar–11 Apr 2025</strong> · UTC · Eight stations · Six-week snapshot</p>
+</header>
+<section class="lead" aria-label="Recommended decisions">
+<strong>Use the records selectively. Send the technician to S07.</strong>
+<p>Apply the channel exclusions and clock repair before summarising. Hold S04 daytime temperature highs and unqualified means; avoid complete rain totals for S04/S08. Confirm that S07’s wind issue persists before dispatch: this recommendation uses the 2025 record, not live status.</p>
+</section>
+<section aria-labelledby="usability-title">
+<h2 id="usability-title">What can support the requested summary?</h2>
+<p class="legend"><b>T</b> temperature · <b>H</b> humidity · <b>P</b> station pressure · <b>W</b> wind speed · <b>D</b> wind direction · <b>R</b> rain · <b>L</b> sunlight</p>
+<table aria-describedby="coverage-note">
+<colgroup><col class="station"><col class="use"><col class="exception"></colgroup>
+<thead><tr><th scope="col">Station</th><th scope="col">Use provisionally</th><th scope="col">Exceptions and reporting instructions</th></tr></thead>
+<tbody><tr><th scope='row'>S01</th><td>All seven channels.</td><td>Keep the low <b>P</b>: high elevation explains it; it is not sea-level pressure.</td></tr><tr><th scope='row'>S02</th><td><b>T† H W D R L</b>; earlier <b>P</b>.</td><td>Exclude <b>P</b> from 21 Mar onward; no recovery shown after the board change.</td></tr><tr><th scope='row'>S03</th><td><b>H P W D R L</b>; retained <b>T</b>.</td><td>Remove 4 isolated <b>T</b> spikes and the 18 Mar–21 Mar stuck readings; qualify <b>R</b> dry-spell results.</td></tr><tr><th scope='row'>S04</th><td><b>H P W D L</b>; retained <b>R</b>; night-only <b>T</b> provisionally.</td><td>Exclude suspect <b>R</b> 29 Mar–2 Apr, including release readings; no complete rain total. <b>T</b>: hold daytime highs and unqualified means.*</td></tr><tr><th scope='row'>S05</th><td>Retained <b>T H P W D R L</b> as a labelled station series.</td><td>Exclude <b>H</b> 7 Mar–11 Mar; suspend mapping and spatial attribution until the location dispute is resolved.</td></tr><tr><th scope='row'>S06</th><td>All channels after the supported clock repair; <b>T†</b> remains provisional.</td><td>Add 6 hours to the affected 24 Mar onward records: 2,639 timestamps repaired, no readings lost.</td></tr><tr><th scope='row'>S07</th><td><b>T† H P D R L</b>; earlier <b>W</b>.</td><td>Exclude <b>W</b> from about 26 Mar onward; no recovery shown and no calibrated multiplier established.</td></tr><tr><th scope='row'>S08</th><td>Available observations in every channel; <b>T†</b> provisional.</td><td>5,834/6,048 unique times; 16 Mar–18 Mar gap. Remove 144 later replay copies, retain originals; rain total is partial.</td></tr></tbody>
+</table>
+<p class="table-note" id="coverage-note">Coverage counts unique 10-minute times after clock repair: 6,048 expected per station; S08 has 214 missing. Replay originals count once. Complete timestamps do not prove accurate measurements; use retained intervals only, with explicit coverage.</p>
+</section>
+<section class="visit" aria-labelledby="visit-title">
+<h2 id="visit-title">One hour at S07 · Riverbend Farm</h2>
+<p class="first"><b>First check:</b> identify the replacement anemometer and compare its documented output with the logger’s configured input.</p>
+<div class="visit-grid">
+<ol aria-label="One-hour visit sequence">
+<li><time>0–10</time>Record model/serial labels and current settings.</li>
+<li><time>10–25</time>Inspect cups, mounting and visible damage safely; compare both manuals.</li>
+<li><time>25–45</time>Check compatibility and document a short comparison beside a portable wind reference.</li>
+<li><time>45–60</time>Save evidence; agree the next repair or manufacturer-supported setup step.</li>
+</ol>
+<div>
+<p><b>Bring:</b> old/new sensor model details, logger manual and settings access, camera, and a portable wind reference if available.</p>
+<p><b>Useful outcome:</b> establish compatibility or a specific unresolved mismatch, and define the repair needed; a short field comparison is not certified calibration.</p>
+</div>
+</div>
+<p class="runner"><b>Runner-up: S04.</b> Its sunny-temperature concern matters, but the cause remains unresolved and the rain gauge resumes small readings after cleaning. S07’s wind relationship remains shifted to record end after a different-brand replacement; a compatibility visit can prevent more unusable data.</p>
+</section>
+<section class="limits" aria-label="Limits of this recommendation">
+<p><b>* Reporting precaution, not a new flag:</b> S04’s sunny temperature difference increased about 1.8°C relative to peers; night/cloudy changes are much smaller. Withhold its daytime highs and unqualified mean pending a shield/reference check. <b>†</b> Other daylight-temperature warnings remain unresolved; qualify daytime extremes. S03/S08 dry-spell rain warnings also need qualification.</p>
+<p>S05’s location sources disagree; which is wrong is unknown. S07’s start is estimated and setting-sensitive, not a known failure instant. Volunteer-note times have no timezone; peers support evidence but are not certified references.</p>
+</section>
+<footer>Six-week snapshot only; no long-term climate trend claim. Dates above are overviews: apply precise channel intervals in flags.csv.</footer>
+</main></body></html>
