@@ -62,7 +62,13 @@ The new reproducibility script performs these archive/import/tests/two-CWD/byte/
 python analysis/validate_source_review.py "path with spaces/to/pack folder"
 ```
 
-Git is required for this verification script only. Its output may be redirected into ignored `tmp/`; the first execution record is retained locally as `tmp/step4-baseline.json`. The initial baseline predates the new handoff files; a post-commit rerun against the complete handoff is required before providing the ZIP. Documentation-only changes do not justify detector changes. No material implementation failure was found.
+Git is required for this verification script only. Its output may be redirected into ignored `tmp/`; the first execution record is retained locally as `tmp/step4-baseline.json`. The initial baseline predates the new handoff files. Documentation-only changes do not justify detector changes. No material implementation failure was found.
+
+### Complete committed handoff rerun
+
+After inspecting/staging only the four handoff additions, genuine commit `27eda8ee594cd3dba4cec63d3b9852c0faf58a3f` was created. The same verifier was then executed again against that committed HEAD, now including **all 25 tracked files**, with full results retained locally in ignored `tmp/step4-handoff.json`. The clean copy was `tmp/source review 6o62w2vf/tracked copy` and the alternate CWD was its sibling `alternate output with spaces`; the separate input and interpreter paths were unchanged. Actual subprocess commands were those above with the new clean path substituted.
+
+The fresh suite passed **17 tests in 7.791 s**. Package import, both CWD checker commands and the report rebuild all exited 0; both CSVs remained byte-identical at the hashes above, the report remained byte-identical and structurally self-contained, no third-party Python import was found, and all 19 inputs were unchanged. This checks the new handoff files as part of the archive rather than relying only on the pre-handoff baseline. A `git archive` ZIP of this commit was also checked against every tracked path and each committed file's bytes: all 25 matched, including the three `quality_checker` modules; ZIP integrity passed. The subsequent commit only adds this observed result to this document. The delivered ZIP is regenerated from final HEAD and checked again, not left at the earlier commit.
 
 ## Report handoff and prior print evidence
 
