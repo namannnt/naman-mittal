@@ -776,7 +776,13 @@ def _metadata_number(station: StationData, key: str) -> float | None:
         return None
 
 
-def _peer_ids(station: StationData, stations: Sequence[StationData], channel: str, config: Thresholds) -> list[str]:
+def _peer_ids(
+    station: StationData,
+    stations: Sequence[StationData],
+    channel: str,
+    series: dict[str, dict[datetime, WeatherRecord]],
+    config: Thresholds,
+) -> list[str]:
     lat, lon, elevation = (_metadata_number(station, key) for key in ("lat", "lon", "elevation_m"))
     if lat is None or lon is None or elevation is None:
         return []
@@ -790,7 +796,15 @@ def _peer_ids(station: StationData, stations: Sequence[StationData], channel: st
             continue
         distance = _haversine_m(lat, lon, peer_lat, peer_lon) / 1000.0
         elevation_difference = abs(elevation - peer_elevation)
-        if distance <= config.peer_max_distance_km and elevation_difference <= maximum_elevation:
+        if distance > config.peer_max_distance_km or elevation_difference > maximum_elevation:
+            continue
+        overlap = set(series.get(station.station_id, {})) & set(series.get(peer.station_id, {}))
+        usable_overlap = sum(
+            series[station.station_id][timestamp].value(channel) is not None
+            and series[peer.station_id][timestamp].value(channel) is not None
+            for timestamp in overlap
+        )
+        if usable_overlap >= config.peer_min_overlap:
             candidates.append((distance, elevation_difference, peer.station_id))
     return [station_id for _, _, station_id in sorted(candidates)]
 
@@ -842,7 +856,7 @@ def _pressure_shift_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "pressure_hpa", config)
+    peers = _peer_ids(station, stations, "pressure_hpa", series, config)
     if len(peers) < config.peer_min_count_per_timestamp:
         diagnostics.append(Diagnostic(station.station_id, "pressure_hpa", None, None, "pressure shift not assessed", f"Only {len(peers)} metadata-eligible peers.", f"At least {config.peer_min_count_per_timestamp} trustworthy peers are required."))
         return flags, diagnostics
@@ -913,7 +927,7 @@ def _wind_scale_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "wind_kmh", config)
+    peers = _peer_ids(station, stations, "wind_kmh", series, config)
     ratios: list[tuple[datetime, float]] = []
     for timestamp, record in sorted(series[station.station_id].items()):
         value = record.value("wind_kmh")
@@ -943,7 +957,7 @@ def _wind_scale_checks(
         assert coverage
         _, factor, boundary, before_n, after_n = best
         note = _nearest_note(notes, station.station_id, boundary)
-        flags.append(Flag(station.station_id, "wind_kmh", boundary, coverage[1], "persistent wind-scale change", "exclude", f"Station/peer wind relationship changed by factor {factor:.2f} across {before_n}/{after_n} non-calm observations and no calibration multiplier is inferred{note}."))
+        flags.append(Flag(station.station_id, "wind_kmh", boundary, coverage[1], "persistent wind-scale change", "exclude", f"Station/peer wind relationship changed by factor {factor:.2f} across {before_n}/{after_n} non-calm observations, the six-hour scan boundary is approximate, and no calibration multiplier is inferred{note}."))
     return flags, diagnostics
 
 
@@ -957,7 +971,7 @@ def _daylight_temperature_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "temp_c", config)
+    peers = _peer_ids(station, stations, "temp_c", series, config)
     observations: list[tuple[datetime, str, float]] = []
     for timestamp, record in sorted(series[station.station_id].items()):
         if _is_unreliable(unreliable_flags, station.station_id, "temp_c", timestamp):
@@ -1002,7 +1016,7 @@ def _rain_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "rain_mm", config)
+    peers = _peer_ids(station, stations, "rain_mm", series, config)
     records = sorted(series[station.station_id].values(), key=lambda record: record.interpreted_utc or datetime.min.replace(tzinfo=timezone.utc))
     minimum_rows = math.ceil(config.rain_zero_min_hours * 60 / station.interval_minutes)
     start = 0

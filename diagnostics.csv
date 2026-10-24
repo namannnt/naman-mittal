@@ -1,0 +1,13 @@
+station_id,channel,start_utc,end_utc,candidate,evidence,missing_evidence
+S01,metadata,,,partial GPS evidence,4 checksum-invalid sentences and 14 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S01,pressure_hpa,,,pressure shift not assessed,Only 0 metadata-eligible peers.,At least 2 trustworthy peers are required.
+S01,wind_kmh,,,wind scale not assessed,Only 0 stable-ratio observations from 0 eligible peers.,More non-calm overlap with at least two trustworthy peers is required.
+S02,metadata,,,partial GPS evidence,30 checksum-invalid sentences and 18 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S03,metadata,,,partial GPS evidence,3 checksum-invalid sentences and 13 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S03,rain_mm,2025-03-14 14:00,2025-03-18 22:10,possible rain under-catch,Zero run spans 626 rows while regional peers were wet in 15 intervals.,No independent release/service evidence makes blockage distinguishable from local rainfall differences.
+S04,metadata,,,partial GPS evidence,4 checksum-invalid sentences and 26 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S05,metadata,,,partial GPS evidence,1 checksum-invalid sentences and 25 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S06,metadata,,,partial GPS evidence,3 checksum-invalid sentences and 18 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S07,metadata,,,partial GPS evidence,2 checksum-invalid sentences and 24 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S08,metadata,,,partial GPS evidence,8 checksum-invalid sentences and 22 void RMC positions were ignored.,This does not invalidate weather measurements; only valid messages may support timing/location conclusions.
+S08,rain_mm,2025-03-07 09:00,2025-03-14 13:50,possible rain under-catch,Zero run spans 1038 rows while regional peers were wet in 14 intervals.,No independent release/service evidence makes blockage distinguishable from local rainfall differences.
