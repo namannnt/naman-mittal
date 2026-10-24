@@ -121,6 +121,10 @@ class Flag:
     def __post_init__(self) -> None:
         if self.action not in {"exclude", "correct", "keep"}:
             raise ValueError(f"unsupported action: {self.action}")
+        if self.channel not in {*CHANNELS, "timestamp_utc", "all", "metadata"}:
+            raise ValueError(f"unsupported channel: {self.channel}")
+        if self.end_utc < self.start_utc:
+            raise ValueError("flag interval is reversed")
 
     def as_row(self) -> dict[str, str]:
         return {
@@ -233,6 +237,10 @@ def nmea_coordinate(value: str, hemisphere: str, latitude: bool) -> float | None
         degree_digits = 2 if latitude else 3
         degrees = int(value[:degree_digits])
         minutes = float(value[degree_digits:])
+        if not math.isfinite(minutes) or not 0 <= minutes < 60:
+            return None
+        if hemisphere not in ({"N", "S"} if latitude else {"E", "W"}):
+            return None
         result = degrees + minutes / 60.0
         if hemisphere in {"S", "W"}:
             result *= -1
@@ -308,10 +316,15 @@ def _parse_gps_file(path: Path, station_id: str) -> list[GPSObservation]:
 
 def _offset_segments(observations: Sequence[GPSObservation], config: Thresholds) -> list[OffsetSegment]:
     points: list[tuple[GPSObservation, int]] = []
+    seen_epochs = set()
     unit = config.gps_offset_round_seconds
     for observation in observations:
         if not observation.trustworthy_time:
             continue
+        epoch = (observation.gps_time, observation.logger_time)
+        if epoch in seen_epochs:
+            continue
+        seen_epochs.add(epoch)
         raw_offset = (observation.logger_time - observation.gps_time).total_seconds()  # type: ignore[operator]
         rounded = int(round(raw_offset / unit) * unit)
         points.append((observation, rounded))
@@ -408,23 +421,32 @@ def _load_pack(pack: Path, config: Thresholds) -> tuple[list[StationData], list[
         except ValueError:
             interval = 10
         stations.append(StationData(station_id, dict(metadata), interval, records, gps, _offset_segments(gps, config)))
-    return stations, metadata_rows
+    return sorted(stations, key=lambda item: item.station_id), metadata_rows
 
 
 def _find_clock_boundary(
-    records: Sequence[WeatherRecord], old_offset: int, new_offset: int, interval_seconds: int, config: Thresholds
+    records: Sequence[WeatherRecord], old: OffsetSegment, new: OffsetSegment, interval_seconds: int, config: Thresholds
 ) -> int | None:
-    expected_raw_delta = interval_seconds + (new_offset - old_offset)
     candidates = []
     for index in range(1, len(records)):
         previous, current = records[index - 1].logger_time, records[index].logger_time
         if previous is None or current is None:
             continue
         raw_delta = int((current - previous).total_seconds())
-        error = abs(raw_delta - expected_raw_delta)
-        if error <= config.gps_boundary_tolerance_seconds:
-            candidates.append((error, index))
-    return min(candidates)[1] if candidates else None
+        before_utc = previous - timedelta(seconds=old.offset_seconds)
+        after_utc = current - timedelta(seconds=new.offset_seconds)
+        corrected_delta = int((after_utc - before_utc).total_seconds())
+        # Absolute GPS times constrain the source-order transition; elapsed time
+        # may include a real outage and is never inferred from source row count.
+        tolerance = timedelta(seconds=config.gps_boundary_tolerance_seconds)
+        in_bracket = (
+            old.last_gps_time - tolerance <= before_utc <= new.first_gps_time + tolerance
+            and before_utc < after_utc <= new.last_gps_time + tolerance
+        )
+        on_grid = corrected_delta >= interval_seconds and corrected_delta % interval_seconds == 0
+        if in_bracket and on_grid and raw_delta != interval_seconds:
+            candidates.append(index)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _apply_clock_evidence(station: StationData, config: Thresholds) -> tuple[list[Flag], list[Diagnostic]]:
@@ -441,14 +463,23 @@ def _apply_clock_evidence(station: StationData, config: Thresholds) -> tuple[lis
     corrections: list[tuple[int, int, OffsetSegment]] = []
     first = segments[0]
     if abs(first.offset_seconds) >= config.gps_offset_change_seconds:
-        corrections.append((0, -first.offset_seconds, first))
+        times = [r.logger_time - timedelta(seconds=first.offset_seconds)
+                 for r in station.records if r.logger_time]
+        tolerance = timedelta(minutes=station.interval_minutes)
+        if times and first.first_gps_time <= min(times) + tolerance:
+            corrections.append((0, -first.offset_seconds, first))
+        else:
+            diagnostics.append(Diagnostic(station.station_id, "all", first.first_gps_time,
+                first.last_gps_time, "initial clock scope uncertain",
+                f"First supported GPS segment shows offset {first.offset_seconds}s but starts after the first weather records.",
+                "Evidence does not establish the offset of earlier weather rows; no whole-file correction is forced."))
     for previous, current in zip(segments, segments[1:]):
         if abs(current.offset_seconds - previous.offset_seconds) < config.gps_offset_change_seconds:
             continue
         boundary = _find_clock_boundary(
             station.records,
-            previous.offset_seconds,
-            current.offset_seconds,
+            previous,
+            current,
             station.interval_minutes * 60,
             config,
         )
@@ -487,7 +518,7 @@ def _apply_clock_evidence(station: StationData, config: Thresholds) -> tuple[lis
                 correction_evidence=evidence,
             )
         affected = [record for record in corrected[start_index:end_index] if record.interpreted_utc]
-        if affected:
+        if affected and correction_seconds:
             sign = "+" if correction_seconds >= 0 else "-"
             flags.append(
                 Flag(
@@ -561,7 +592,8 @@ def _timeline_checks(station: StationData, config: Thresholds) -> tuple[list[Fla
             )
 
     excluded = duplicate_indices | conflicted_indices
-    usable = [record for index, record in enumerate(station.records) if index not in excluded and record.interpreted_utc]
+    # Conflicted timestamps are present observations, not missing slots.
+    usable = [station.records[indices[0]] for _, indices in sorted(by_time.items())]
     usable.sort(key=lambda record: (record.interpreted_utc, record.source_row))
     interval = timedelta(minutes=station.interval_minutes)
     for previous, current in zip(usable, usable[1:]):
@@ -587,6 +619,8 @@ def _gps_checks(station: StationData, config: Thresholds) -> tuple[list[Flag], l
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
     positions = [observation for observation in station.gps if observation.trustworthy_position]
+    position_epochs = {observation.logger_time.replace(second=0, microsecond=0)
+                       for observation in positions if observation.logger_time is not None}
     invalid_checksums = sum(not observation.checksum_valid for observation in station.gps)
     void_rmc = sum(observation.sentence_type == "RMC" and observation.rmc_status == "V" for observation in station.gps)
     if invalid_checksums or void_rmc:
@@ -607,11 +641,12 @@ def _gps_checks(station: StationData, config: Thresholds) -> tuple[list[Flag], l
         distances = [_haversine_m(metadata_lat, metadata_lon, observation.latitude, observation.longitude) for observation in positions if observation.latitude is not None and observation.longitude is not None]
     if distances:
         summary["median_distance_m"] = statistics.median(distances)
-    if len(distances) >= config.gps_min_position_observations and summary["median_distance_m"] >= config.gps_location_disagreement_m:
+    summary["position_epochs"] = len(position_epochs)
+    if len(position_epochs) >= config.gps_min_position_observations and distances and summary["median_distance_m"] >= config.gps_location_disagreement_m:
         coverage = _coverage(station)
         if coverage:
             flags.append(
-                Flag(station.station_id, "metadata", coverage[0], coverage[1], "GPS/location disagreement", "exclude", f"{len(distances)} trustworthy GPS positions are a median {summary['median_distance_m'] / 1000:.2f} km from station metadata; which source is wrong is unresolved.")
+                Flag(station.station_id, "metadata", coverage[0], coverage[1], "GPS/location disagreement", "exclude", f"Disputed location only: {len(distances)} valid position messages at {len(position_epochs)} distinct logger-minute epochs differ from metadata by median {summary['median_distance_m'] / 1000:.2f} km; retain weather channels pending identity checks.")
             )
     return flags, diagnostics, summary
 
@@ -751,6 +786,7 @@ def _is_unreliable(flags: Sequence[Flag], station_id: str, channel: str, timesta
     return any(
         flag.station_id == station_id
         and flag.action == "exclude"
+        and flag.issue != "exact replay copies"
         and flag.channel in {"all", channel}
         and flag.start_utc <= timestamp <= flag.end_utc
         for flag in flags
@@ -782,7 +818,11 @@ def _peer_ids(
     channel: str,
     series: dict[str, dict[datetime, WeatherRecord]],
     config: Thresholds,
+    unreliable_flags: Sequence[Flag] = (),
 ) -> list[str]:
+    disputed = {flag.station_id for flag in unreliable_flags if flag.channel == "metadata" and flag.issue == "GPS/location disagreement"}
+    if station.station_id in disputed:
+        return []
     lat, lon, elevation = (_metadata_number(station, key) for key in ("lat", "lon", "elevation_m"))
     if lat is None or lon is None or elevation is None:
         return []
@@ -790,6 +830,8 @@ def _peer_ids(
     candidates = []
     for peer in stations:
         if peer.station_id == station.station_id:
+            continue
+        if peer.station_id in disputed:
             continue
         peer_lat, peer_lon, peer_elevation = (_metadata_number(peer, key) for key in ("lat", "lon", "elevation_m"))
         if peer_lat is None or peer_lon is None or peer_elevation is None:
@@ -846,6 +888,53 @@ def _nearest_note(notes: Sequence[dict[str, str]], station_id: str, timestamp: d
     return f"; maintenance note dated {nearest[1]['date_raw']} says '{sanitized}' (timezone unspecified)"
 
 
+def _refine_boundary(points: Sequence[tuple[datetime, float]], coarse: datetime,
+                     before: float, after: float, config: Thresholds) -> datetime:
+    """Fixed-level L1 split, using observed times rather than an elapsed-row grid."""
+    radius = timedelta(hours=config.local_boundary_hours)
+    local = [(t, v) for t, v in points if coarse - radius <= t <= coarse + radius]
+    minimum = config.change_min_observations_each_side
+    if len(local) < minimum * 2:
+        return coarse
+    cost = sum(abs(v - after) for _, v in local)
+    best = None
+    for index, (timestamp, value) in enumerate(local):
+        if minimum <= index <= len(local) - minimum:
+            candidate = (cost, abs((timestamp - coarse).total_seconds()), timestamp)
+            if best is None or candidate < best:
+                best = candidate
+        cost += abs(value - before) - abs(value - after)
+    return best[2] if best else coarse
+
+
+def _recovery_boundary(points: Sequence[tuple[datetime, float]], boundary: datetime,
+                       baseline: float, changed: float, config: Thresholds) -> datetime | None:
+    """Require a populated full-day return before ending an exclusion.
+
+    Candidate windows use elapsed UTC; a missing day cannot confirm recovery.
+    Refine the transition locally only after sustained return is corroborated.
+    """
+    duration = timedelta(hours=config.recovery_confirmation_hours)
+    separation = abs(changed - baseline)
+    if not points or separation == 0:
+        return None
+    steps = [(b[0] - a[0]).total_seconds() for a, b in zip(points, points[1:]) if b[0] > a[0]]
+    nominal = statistics.median(steps) if steps else 600
+    required = max(24, math.ceil(duration.total_seconds() / nominal * 0.8))
+    for candidate, _ in points:
+        if candidate < boundary + duration or candidate + duration > points[-1][0]:
+            continue
+        if candidate.minute or candidate.hour % 6:
+            continue
+        values = [v for t, v in points if candidate <= t < candidate + duration]
+        if len(values) < required:
+            continue
+        near = sum(abs(v - baseline) <= separation / 2 for v in values) / len(values)
+        if abs(statistics.median(values) - baseline) <= config.recovery_baseline_fraction * separation and near >= 0.8:
+            return _refine_boundary(points, candidate, changed, baseline, config)
+    return None
+
+
 def _pressure_shift_checks(
     station: StationData,
     stations: Sequence[StationData],
@@ -856,7 +945,7 @@ def _pressure_shift_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "pressure_hpa", series, config)
+    peers = _peer_ids(station, stations, "pressure_hpa", series, config, unreliable_flags)
     if len(peers) < config.peer_min_count_per_timestamp:
         diagnostics.append(Diagnostic(station.station_id, "pressure_hpa", None, None, "pressure shift not assessed", f"Only {len(peers)} metadata-eligible peers.", f"At least {config.peer_min_count_per_timestamp} trustworthy peers are required."))
         return flags, diagnostics
@@ -873,7 +962,7 @@ def _pressure_shift_checks(
     if not candidates:
         return flags, diagnostics
     window = timedelta(hours=config.change_window_hours)
-    for _, _, boundary in sorted(candidates, reverse=True):
+    for _, _, boundary in sorted(candidates, key=lambda item: item[2]):
         residual_before: list[float] = []
         residual_after: list[float] = []
         for record in records:
@@ -897,8 +986,20 @@ def _pressure_shift_checks(
         coverage = _coverage(station)
         if not coverage:
             continue
+        points = []
+        for record in records:
+            t = record.interpreted_utc
+            value = record.value("pressure_hpa")
+            if t is None or value is None:
+                continue
+            reference = _peer_value(t, "pressure_hpa", peers, series, unreliable_flags, config.peer_min_count_per_timestamp)
+            if reference is not None:
+                points.append((t, value - reference))
+        recovery = _recovery_boundary(points, boundary, statistics.median(residual_before), statistics.median(residual_after), config)
+        end = recovery - timedelta(minutes=station.interval_minutes) if recovery else coverage[1]
         note = _nearest_note(notes, station.station_id, boundary)
-        flags.append(Flag(station.station_id, "pressure_hpa", boundary, coverage[1], "sustained pressure shift", "exclude", f"Station-minus-peer median changed by {shift:+.1f} hPa across {len(residual_before)}/{len(residual_after)} observations around an abrupt step and calibration is unknown{note}."))
+        ending = "confirmed return to baseline ends the interval" if recovery else "no sustained return to baseline was established"
+        flags.append(Flag(station.station_id, "pressure_hpa", boundary, end, "sustained pressure shift", "exclude", f"Station-minus-peer median changed by {shift:+.1f} hPa across {len(residual_before)}/{len(residual_after)} observations and {ending}; calibration is unknown{note}."))
         break
     return flags, diagnostics
 
@@ -927,7 +1028,7 @@ def _wind_scale_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "wind_kmh", series, config)
+    peers = _peer_ids(station, stations, "wind_kmh", series, config, unreliable_flags)
     ratios: list[tuple[datetime, float]] = []
     for timestamp, record in sorted(series[station.station_id].items()):
         value = record.value("wind_kmh")
@@ -942,6 +1043,7 @@ def _wind_scale_checks(
         return flags, diagnostics
     window = timedelta(hours=config.change_window_hours)
     best = None
+    qualifying = []
     timestamps = [item[0] for item in ratios]
     for boundary in _windowed_change_candidates(timestamps, window):
         before = [math.log(value) for timestamp, value in ratios if boundary - window <= timestamp < boundary]
@@ -952,12 +1054,59 @@ def _wind_scale_checks(
         magnitude = max(factor, 1.0 / factor)
         if best is None or magnitude > best[0]:
             best = (magnitude, factor, boundary, len(before), len(after))
+        if magnitude >= config.wind_scale_factor_min:
+            qualifying.append((magnitude, factor, boundary, len(before), len(after)))
+    # A transient change in terrain/weather relationships must not displace a
+    # later persistent fault. Require three populated post-split daily windows.
+    if qualifying:
+        events = [[qualifying[0]]]
+        for candidate in qualifying[1:]:
+            if candidate[2] - events[-1][-1][2] > timedelta(hours=12):
+                events.append([candidate])
+            else:
+                events[-1].append(candidate)
+        best = None
+        points = [(t, math.log(v)) for t, v in ratios]
+        for event in events:
+            proposal = max(event, key=lambda item: item[0])
+            coarse = proposal[2]
+            before_level = statistics.median(v for t, v in points if coarse - window <= t < coarse)
+            after_level = statistics.median(v for t, v in points if coarse <= t < coarse + window)
+            split = _refine_boundary(points, coarse, before_level, after_level, config)
+            delta = after_level - before_level
+            confirmed = True
+            established = [v for t, v in points if t < coarse - window]
+            if (len(established) < config.change_min_observations_each_side
+                    or abs(statistics.median(established) - before_level)
+                    > abs(delta) * config.wind_baseline_consistency_fraction):
+                diagnostics.append(Diagnostic(station.station_id, "wind_kmh", split, split,
+                    "unestablished wind baseline", "Local pre-change relationship differs from the earlier established relationship or lacks sufficient earlier coverage.",
+                    "A return from a transient must not be mistaken for a new sensor fault; a stable earlier reference relationship is required."))
+                continue
+            for day in range(config.wind_confirmation_days):
+                begin = split + timedelta(days=day)
+                values = [v for t, v in points if begin <= t < begin + timedelta(days=1)]
+                if len(values) < config.wind_confirmation_min_daily_observations or (statistics.median(values) - before_level) * (1 if delta > 0 else -1) < abs(delta) / 2:
+                    confirmed = False
+                    break
+            if confirmed:
+                best = proposal
+                break
+            diagnostics.append(Diagnostic(station.station_id, "wind_kmh", split, split + timedelta(days=config.wind_confirmation_days), "unconfirmed wind relationship change", f"A factor {proposal[1]:.2f} candidate did not persist through {config.wind_confirmation_days} populated daily confirmation windows.", "Real weather, terrain or short-lived sensor behavior remain alternatives; no sustained-fault action is justified."))
     if best and best[0] >= config.wind_scale_factor_min:
         coverage = _coverage(station)
         assert coverage
         _, factor, boundary, before_n, after_n = best
+        points = [(t, math.log(v)) for t, v in ratios]
+        before_level = statistics.median(v for t, v in points if boundary - window <= t < boundary)
+        after_level = statistics.median(v for t, v in points if boundary <= t < boundary + window)
+        coarse = boundary
+        boundary = _refine_boundary(points, coarse, before_level, after_level, config)
+        recovery = _recovery_boundary(points, boundary, before_level, after_level, config)
+        end = recovery - timedelta(minutes=station.interval_minutes) if recovery else coverage[1]
         note = _nearest_note(notes, station.station_id, boundary)
-        flags.append(Flag(station.station_id, "wind_kmh", boundary, coverage[1], "persistent wind-scale change", "exclude", f"Station/peer wind relationship changed by factor {factor:.2f} across {before_n}/{after_n} non-calm observations, the six-hour scan boundary is approximate, and no calibration multiplier is inferred{note}."))
+        flags.append(Flag(station.station_id, "wind_kmh", boundary, end, "persistent wind-scale change", "exclude", f"Smoothed wind ratio changed by factor {factor:.2f} across {before_n}/{after_n} eligible observations around coarse {coarse.strftime(WEATHER_TIMESTAMP)}, with local split at {boundary.strftime(WEATHER_TIMESTAMP)} approximate and no calibrated multiplier inferred{note}."))
+        diagnostics.append(Diagnostic(station.station_id, "wind_kmh", boundary, end, "wind boundary and recovery evidence", f"Peers {','.join(peers)}; ratio=(station+{config.wind_ratio_floor_kmh:g})/(peer median+{config.wind_ratio_floor_kmh:g}), peer median >= {config.wind_ratio_floor_kmh:g} km/h; factor is exp(median(log ratio) after minus before) in {config.change_window_hours:g}-hour windows; recovery={'observed' if recovery else 'not established'}.", "Local L1 split estimates a statistical change, not the exact physical replacement instant."))
     return flags, diagnostics
 
 
@@ -971,7 +1120,7 @@ def _daylight_temperature_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "temp_c", series, config)
+    peers = _peer_ids(station, stations, "temp_c", series, config, unreliable_flags)
     observations: list[tuple[datetime, str, float]] = []
     for timestamp, record in sorted(series[station.station_id].items()):
         if _is_unreliable(unreliable_flags, station.station_id, "temp_c", timestamp):
@@ -1003,6 +1152,8 @@ def _daylight_temperature_checks(
         coverage = _coverage(station)
         assert coverage
         flags.append(Flag(station.station_id, "temp_c", best[1], coverage[1], "daylight-dependent temperature shift", "exclude", f"Daylight station-minus-peer median changed {best[2]:+.1f} C while night changed {best[3]:+.1f} C across matched observations; radiation-related bias is supported."))
+    elif best and abs(best[2]) >= config.daylight_diagnostic_min_c:
+        diagnostics.append(Diagnostic(station.station_id, "temp_c", best[1], _coverage(station)[1], "unresolved daylight temperature change", f"Largest 72-hour day/night contrast: daylight residual shift {best[2]:+.2f} C, night {best[3]:+.2f} C; peers {','.join(peers)} with known channel faults masked.", "Effect is below the action threshold or lacks a stable night baseline; solar intensity, wind, terrain and peer composition may explain it, so inspect sunny/cloudy/night strata before action."))
     return flags, diagnostics
 
 
@@ -1016,7 +1167,7 @@ def _rain_checks(
 ) -> tuple[list[Flag], list[Diagnostic]]:
     flags: list[Flag] = []
     diagnostics: list[Diagnostic] = []
-    peers = _peer_ids(station, stations, "rain_mm", series, config)
+    peers = _peer_ids(station, stations, "rain_mm", series, config, unreliable_flags)
     records = sorted(series[station.station_id].values(), key=lambda record: record.interpreted_utc or datetime.min.replace(tzinfo=timezone.utc))
     minimum_rows = math.ceil(config.rain_zero_min_hours * 60 / station.interval_minutes)
     start = 0
@@ -1029,6 +1180,7 @@ def _rain_checks(
             end += 1
         if end - start >= minimum_rows:
             regional_wet = 0
+            wet_timestamps = []
             for record in records[start:end]:
                 timestamp = record.interpreted_utc
                 if timestamp is None:
@@ -1040,6 +1192,7 @@ def _rain_checks(
                         wet_peers += 1
                 if wet_peers >= config.rain_peer_wet_min_stations:
                     regional_wet += 1
+                    wet_timestamps.append(timestamp)
             releases = []
             for offset in range(end, min(len(records), end + config.rain_release_max_intervals_after)):
                 record = records[offset]
@@ -1049,13 +1202,16 @@ def _rain_checks(
                     continue
                 peer_values = [series[peer_id][timestamp].value("rain_mm") for peer_id in peers if timestamp in series.get(peer_id, {}) and not _is_unreliable(unreliable_flags, peer_id, "rain_mm", timestamp)]
                 peer_values = [value for value in peer_values if value is not None]
-                if peer_values and statistics.median(peer_values) <= config.rain_release_peer_median_max_mm:
+                if len(peer_values) >= config.peer_min_count_per_timestamp and statistics.median(peer_values) <= config.rain_release_peer_median_max_mm:
                     releases.append(record)
             first, last = records[start], records[end - 1]
             if regional_wet >= config.rain_peer_wet_min_intervals and releases:
-                last = releases[-1]
-                note = _nearest_note(notes, station.station_id, last.interpreted_utc)  # type: ignore[arg-type]
-                flags.append(Flag(station.station_id, "rain_mm", first.interpreted_utc, last.interpreted_utc, "blocked/released rain gauge", "exclude", f"Zero rain persisted for {end - start} rows while >=2 peers were wet in {regional_wet} intervals, followed by {len(releases)} station-only readings >= {config.rain_release_min_mm:g} mm, and no redistribution is attempted{note}."))  # type: ignore[arg-type]
+                note = _nearest_note(notes, station.station_id, releases[-1].interpreted_utc)  # type: ignore[arg-type]
+                flags.append(Flag(station.station_id, "rain_mm", wet_timestamps[0], last.interpreted_utc, "suspected rain-gauge blockage", "exclude", f"Zero rain coincides with >={config.rain_peer_wet_min_stations} wet peers in {regional_wet} intervals and ends in a station-only release; exclude conservatively from the first corroborating wet interval, with physical onset uncertain{note}."))  # type: ignore[arg-type]
+                for release_group in _group_consecutive([records.index(record) for record in releases]):
+                    release_first, release_last = records[release_group[0]], records[release_group[-1]]
+                    flags.append(Flag(station.station_id, "rain_mm", release_first.interpreted_utc, release_last.interpreted_utc, "rain-gauge release readings", "exclude", f"Source rows {release_first.source_row}-{release_last.source_row} contain station-only readings >={config.rain_release_min_mm:g} mm following corroborated under-catch; no redistribution is justified."))
+                diagnostics.append(Diagnostic(station.station_id, "rain_mm", first.interpreted_utc, wet_timestamps[0], "rain blockage onset uncertainty", f"Zero run begins {first.interpreted_utc.strftime(WEATHER_TIMESTAMP)}, but first simultaneous regional-wet evidence is {wet_timestamps[0].strftime(WEATHER_TIMESTAMP)}.", "Dry readings before regional-wet evidence do not prove blockage and remain outside the exclusion."))
             elif regional_wet >= config.rain_peer_wet_min_intervals:
                 diagnostics.append(Diagnostic(station.station_id, "rain_mm", first.interpreted_utc, last.interpreted_utc, "possible rain under-catch", f"Zero run spans {end - start} rows while regional peers were wet in {regional_wet} intervals.", "No independent release/service evidence makes blockage distinguishable from local rainfall differences."))
         start = end
@@ -1138,16 +1294,19 @@ def run_checker(pack_dir: Path | str, output_dir: Path | str = ".", config: Thre
         flags.extend(_persistence_checks(station, excluded, config))
         flags.extend(_temperature_spikes(station, excluded, config))
 
-    base_flags = _deduplicate_flags(flags)
     series = {station.station_id: _unique_series(station, excluded_indices[station.station_id]) for station in stations}
 
     # Peer-based checks consume corrected, unique records and avoid already
     # excluded station/channel intervals as references.
-    for station in stations:
-        for detector in (_pressure_shift_checks, _wind_scale_checks, _daylight_temperature_checks, _rain_checks):
-            new_flags, new_diagnostics = detector(station, stations, series, base_flags + flags, notes, config)
+    for detector in (_pressure_shift_checks, _wind_scale_checks, _daylight_temperature_checks, _rain_checks):
+        # Each detector sees the same reference mask for every station, avoiding
+        # station-order-dependent contamination within a pass.
+        reference_flags = tuple(flags)
+        for station in stations:
+            new_flags, new_diagnostics = detector(station, stations, series, reference_flags, notes, config)
             flags.extend(new_flags)
             diagnostics.extend(new_diagnostics)
+    for station in stations:
         flags.extend(_high_elevation_keep(station, gps_summaries[station.station_id], flags, config))
 
     final_flags = _deduplicate_flags(flags)

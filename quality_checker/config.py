@@ -48,10 +48,17 @@ class Thresholds:
     pressure_residual_shift_min_hpa: float = 3.0
     wind_ratio_floor_kmh: float = 3.0
     wind_scale_factor_min: float = 2.0
+    wind_confirmation_days: int = 3
+    wind_confirmation_min_daily_observations: int = 48
+    wind_baseline_consistency_fraction: float = 0.5
     daylight_ghi_min_wm2: float = 100.0
     night_ghi_max_wm2: float = 10.0
     daylight_temp_shift_min_c: float = 4.0
     daylight_night_shift_max_c: float = 1.5
+    daylight_diagnostic_min_c: float = 1.0
+    recovery_confirmation_hours: float = 24.0
+    recovery_baseline_fraction: float = 0.25
+    local_boundary_hours: float = 72.0
 
     # Rain blockage requires a long zero run, regional wet evidence, and a
     # station-only release immediately afterwards.

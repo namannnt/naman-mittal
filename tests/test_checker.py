@@ -7,11 +7,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from quality_checker import run_checker
-from quality_checker.core import FLAG_COLUMNS, input_hashes, nmea_coordinate
+from quality_checker.core import FLAG_COLUMNS, CHANNELS, input_hashes, nmea_coordinate
+from quality_checker.config import DEFAULT_THRESHOLDS
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -148,6 +150,7 @@ class CheckerTests(unittest.TestCase):
             self.assertIn(("alpha", "exact replay copies"), issues)
             self.assertIn(("beta", "conflicting observations"), issues)
             self.assertIn(("gamma", "coverage gap"), issues)
+            self.assertFalse(any(f.station_id == "beta" and f.issue == "coverage gap" for f in result.flags))
             with (root / "out" / "flags.csv").open(newline="", encoding="utf-8") as handle:
                 self.assertEqual(next(csv.reader(handle)), FLAG_COLUMNS)
 
@@ -298,7 +301,8 @@ class CheckerTests(unittest.TestCase):
                 peers[name] = regular_rows(start, count, lambda index, timestamp, base: {"rain_mm": 0.4 if boundary - 500 <= index < boundary and index % 20 == 0 else 0})
             pack = write_pack(root, {"target": target, **peers})
             result = run_checker(pack, root / "out")
-            self.assertTrue(any(flag.station_id == "target" and flag.issue == "blocked/released rain gauge" for flag in result.flags))
+            self.assertTrue(any(flag.station_id == "target" and flag.issue == "suspected rain-gauge blockage" for flag in result.flags))
+            self.assertTrue(any(flag.station_id == "target" and flag.issue == "rain-gauge release readings" for flag in result.flags))
             self.assertTrue(any(flag.station_id == "target" and flag.issue == "daylight-dependent temperature shift" for flag in result.flags))
 
     def test_clean_pack_header_only_deterministic_and_current_directory_output(self) -> None:
@@ -316,6 +320,142 @@ class CheckerTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertEqual(first.decode("utf-8").splitlines(), [",".join(FLAG_COLUMNS)])
             self.assertFalse((pack / "flags.csv").exists())
+
+    def test_temporary_pressure_wind_humidity_faults_end_at_recovery(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2030, 2, 1, tzinfo=UTC)
+            count, onset, recovery = 20 * 144, 5 * 144, 12 * 144
+            def pressure(index, timestamp, base):
+                return {"pressure_hpa": base["pressure_hpa"] + (8 if onset <= index < recovery else 0)}
+            def wind(index, timestamp, base):
+                return {"wind_kmh": base["wind_kmh"] * (0.12 if onset <= index < recovery else 1)}
+            def humidity(index, timestamp, base):
+                return {"rh_pct": 104 if onset <= index < recovery else base["rh_pct"]}
+            pack = write_pack(root, {"press": regular_rows(start, count, pressure), "wind": regular_rows(start, count, wind),
+                                     "humid": regular_rows(start, count, humidity), "a": regular_rows(start, count),
+                                     "b": regular_rows(start, count), "c": regular_rows(start, count)})
+            before = input_hashes(pack)
+            result = run_checker(pack, root / "out")
+            self.assertEqual(before, input_hashes(pack))
+            expected_end = start + timedelta(minutes=10 * (recovery - 1))
+            for station_id, issue in (("press", "sustained pressure shift"), ("wind", "persistent wind-scale change"), ("humid", "physical-domain violation")):
+                findings = [f for f in result.flags if f.station_id == station_id and f.issue == issue]
+                self.assertEqual(len(findings), 1, (station_id, findings))
+                self.assertEqual(findings[0].start_utc, start + timedelta(minutes=10 * onset))
+                self.assertEqual(findings[0].end_utc, expected_end)
+            for flag in result.flags:
+                self.assertIn(flag.channel, {*CHANNELS, "timestamp_utc", "all", "metadata"})
+                self.assertIn(flag.action, {"exclude", "correct", "keep"})
+                self.assertLessEqual(flag.start_utc, flag.end_utc)
+                self.assertRegex(flag.as_row()["start_utc"], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+
+    def test_clock_reset_with_outage_preserves_observed_rows_and_real_gap(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2031, 12, 31, 12, tzinfo=UTC)
+            boundary = 144
+            rows = []
+            expected = []
+            for index in range(3 * 144):
+                if boundary <= index < boundary + 6:
+                    continue  # Real one-hour outage at the reset; six absent observations.
+                utc = start + timedelta(minutes=index * 10)
+                raw = utc - (timedelta(minutes=90) if index >= boundary else timedelta())
+                rows.append(weather_row(raw, temp_c=10 + index / 100, pressure_hpa=840 + index / 100))
+                expected.append(utc)
+            gps = []
+            for hour in range(72):
+                utc = start + timedelta(hours=hour)
+                logger = utc - (timedelta(minutes=90) if hour >= 24 else timedelta())
+                gps.append(f"{logger:%Y-%m-%d %H:%M:%S},{rmc(utc)}")
+            pack = write_pack(root, {"reset": rows}, gps={"reset": gps})
+            result = run_checker(pack, root / "out")
+            records = result.stations[0].records
+            self.assertEqual([r.interpreted_utc for r in records], expected)
+            self.assertEqual(len(records), len(rows))
+            gap = [f for f in result.flags if f.issue == "coverage gap"]
+            self.assertEqual(len(gap), 1)
+            self.assertEqual(gap[0].start_utc, start + timedelta(days=1))
+            self.assertEqual(gap[0].end_utc, start + timedelta(days=1, minutes=50))
+            self.assertEqual(records[144].correction_seconds, 5400)
+
+    def test_clock_evidence_without_weather_boundary_remains_unresolved(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2032, 1, 1, tzinfo=UTC)
+            rows = regular_rows(start, 288)  # No reset in weather source order.
+            gps = []
+            for hour in range(48):
+                utc = start + timedelta(hours=hour)
+                logger = utc - (timedelta(hours=2) if hour >= 24 else timedelta())
+                gps.append(f"{logger:%Y-%m-%d %H:%M:%S},{rmc(utc)}")
+            pack = write_pack(root, {"unknown": rows}, gps={"unknown": gps})
+            result = run_checker(pack, root / "out")
+            self.assertFalse(any(f.action == "correct" for f in result.flags))
+            self.assertTrue(any(d.candidate == "GPS clock-offset change" for d in result.diagnostics))
+            self.assertTrue(all(r.correction_seconds == 0 for r in result.stations[0].records))
+
+    def test_disputed_location_does_not_exclude_weather_or_support_spatial_peers(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2033, 1, 1, tzinfo=UTC)
+            rows = regular_rows(start, 10 * 144)
+            gps = []
+            for hour in range(24):
+                utc = start + timedelta(hours=hour)
+                # Two messages at one epoch are one independent timed receiver fix.
+                gps.extend([f"{utc:%Y-%m-%d %H:%M:%S},{rmc(utc, 50, -120)}",
+                            f"{utc:%Y-%m-%d %H:%M:%S},{gga(utc, 50, -120)}"])
+            pack = write_pack(root, {"disputed": rows, "target": regular_rows(start, 10 * 144,
+                lambda i, t, b: {"pressure_hpa": b["pressure_hpa"] + (8 if i >= 5 * 144 else 0)}), "one_peer": rows}, gps={"disputed": gps})
+            result = run_checker(pack, root / "out")
+            location = [f for f in result.flags if f.issue == "GPS/location disagreement"]
+            self.assertEqual(len(location), 1)
+            self.assertIn("48 valid position messages at 24 distinct", location[0].note)
+            self.assertFalse(any(f.station_id == "disputed" and f.channel in {*CHANNELS, "all"} for f in result.flags))
+            self.assertFalse(any(f.station_id == "target" and f.issue == "sustained pressure shift" for f in result.flags))
+            # Repeated copies of one receiver epoch cannot meet the 20-epoch
+            # location-evidence rule or six-epoch timing rule.
+            utc = start
+            same_epoch = [f"{utc:%Y-%m-%d %H:%M:%S},{rmc(utc, 50, -120)}"] * 30
+            (pack / "gps" / "disputed.nmea").write_text("\n".join(same_epoch), encoding="utf-8")
+            repeated_result = run_checker(pack, root / "repeated-epoch-out")
+            self.assertFalse(any(f.issue == "GPS/location disagreement" for f in repeated_result.flags))
+
+    def test_late_initial_gps_offset_does_not_force_whole_file_correction(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2034, 1, 1, tzinfo=UTC)
+            gps = []
+            for hour in range(24, 48):
+                utc = start + timedelta(hours=hour)
+                logger = utc - timedelta(hours=2)
+                gps.append(f"{logger:%Y-%m-%d %H:%M:%S},{rmc(utc)}")
+            pack = write_pack(root, {"late": regular_rows(start, 288)}, gps={"late": gps})
+            result = run_checker(pack, root / "out")
+            self.assertFalse(any(f.action == "correct" for f in result.flags))
+            self.assertTrue(any(d.candidate == "initial clock scope uncertain" for d in result.diagnostics))
+
+    def test_transient_wind_event_does_not_displace_later_persistent_fault(self) -> None:
+        with workspace_tempdir() as temporary:
+            root = Path(temporary)
+            start = datetime(2035, 1, 1, tzinfo=UTC)
+            count, onset = 20 * 144, 12 * 144
+            def mutate(index, timestamp, base):
+                factor = 0.12 if 4 * 144 <= index < int(5.5 * 144) or index >= onset else 1
+                return {"wind_kmh": base["wind_kmh"] * factor}
+            pack = write_pack(root, {"target": regular_rows(start, count, mutate),
+                "a": regular_rows(start, count), "b": regular_rows(start, count), "c": regular_rows(start, count)})
+            result = run_checker(pack, root / "out")
+            findings = [f for f in result.flags if f.station_id == "target" and f.issue == "persistent wind-scale change"]
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].start_utc, start + timedelta(minutes=10 * onset))
+            self.assertEqual(findings[0].end_utc, start + timedelta(minutes=10 * (count - 1)))
+            shorter = run_checker(pack, root / "shorter-out", replace(DEFAULT_THRESHOLDS, change_window_hours=48))
+            findings = [f for f in shorter.flags if f.station_id == "target" and f.issue == "persistent wind-scale change"]
+            self.assertEqual(len(findings), 1)
+            self.assertEqual(findings[0].start_utc, start + timedelta(minutes=10 * onset))
 
 
 if __name__ == "__main__":
