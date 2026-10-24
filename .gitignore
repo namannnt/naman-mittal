@@ -1,0 +1,24 @@
+# Supplied assignment materials (private; never commit or publish)
+/Aeron-AI-Research-Engineer-Intern-AssignmentNew.pdf
+/ridgeline_data_pack (2)/
+/input/
+/inputs/
+/raw/
+
+# Local environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary and generated audit output
+/tmp/
+/output/
+/audit-output/
+*.log
+
+# Intentionally do not ignore all CSV files: final flags.csv must be committable.
