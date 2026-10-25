@@ -1,2 +1,1 @@
-\[AI chat log](https://chatgpt.com/s/cx\_6ade25a63d3481919f407061fe952a27)
-
+﻿<https://chatgpt.com/s/cx_6ade25a63d3481919f407061fe952a27>
