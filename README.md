@@ -1,17 +1,17 @@
-REQUIRED: Candidate full name
-REQUIRED: Candidate email
-REQUIRED: Working recording link
+Naman Mittal
+naman.mittal.btech2023@sitpune.edu.in
+Recording link: https://drive.google.com/file/d/12xBzKS9RWaG5GZ5qF9YhhwhObZrIrYEN/view?usp=drive_link
 Run: python checker.py "ridgeline_data_pack (2)"
 
 # Ridgeline network quality review
 
-Source-review handoff only; not ready for submission. The first three lines deliberately contain unverified-personal-detail placeholders. Candidate-owned `DECISIONS.md`, genuine `ai_logs/` exports and the own-voice recording are still missing. See [candidate completion checklist](docs/candidate_completion_checklist.md).
+This repository contains an offline quality checker for the Ridgeline weather-station data pack, the resulting flags and diagnostics, and a coordinator-facing network health report. Decisions and limitations are discussed in DECISIONS.md. The recording linked above demonstrates the evidence for the S03 temperature flatline and the less-certain S07 wind-scale exclusion.
 
 ## Run and reproduce
 
 Use Python 3.11 or newer (`python --version`). Runtime, analysis scripts and synthetic tests use only the standard library plus the included `quality_checker` package; no pip installation, API key, network access or environment setup is needed. `requirements.txt` records this intentionally empty dependency set. The portability check verifies imports with site packages disabled.
 
-Run the first-line command from the repository root with the supplied extracted folder at that path, or replace the quoted argument with the actual absolute/relative pack location:
+Run the command shown above from the repository root with the supplied extracted folder at that path, or replace the quoted argument with the actual absolute/relative pack location:
 
 ```text
 python checker.py "path with spaces/to/pack folder"
